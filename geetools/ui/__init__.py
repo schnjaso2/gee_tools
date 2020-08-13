@@ -1,70 +1,73 @@
 # coding=utf-8
 """ User Interface Tools """
-from . import chart, imagestrip, ipymap, ipytools, maptool
 import ee
-import multiprocessing
-from .ipymap import Map
+import threading
+import pprint
+from . import dispatcher
 
-if not ee.data._initialized:
-    ee.Initialize()
+ASYNC = False
 
 
-def eprint(eeobject, indent=2, notebook=False, async=False):
-    """ Print an EE Object. Same as `print(object.getInfo())`
+def eprint(*args, **kwargs):
+    """ Print EE Objects. Similar to `print(object.getInfo())` but with
+    some magic (lol)
 
     :param eeobject: object to print
     :type eeobject: ee.ComputedObject
-    :param notebook: if True, prints the object as an Accordion Widget for
-        the Jupyter Notebook
-    :type notebook: bool
     :param indent: indentation of the print output
     :type indent: int
-    :param async: call getInfo() asynchronously
-    :type async: bool
+    :param do_async: call getInfo() asynchronously
+    :type do_async: bool
     """
-
-    import pprint
+    indent = kwargs.get('indent', 2)
+    do_async = kwargs.get('do_async', ASYNC)
     pp = pprint.PrettyPrinter(indent=indent)
 
-    def get_async(eeobject, result):
-        obj = ee.deserializer.decode(eeobject)
-        try:
-            result['result'] = obj.getInfo()
-        except:
-            raise
+    info_return = [None]*len(args)
 
-    def get_async2(eeobject, result):
-        info = eeobject.getInfo()
-        result.append(info)
+    def get_info(eeobject, index):
+        """ Get Info """
+        info_return[index] = dispatcher.dispatch(eeobject)
 
-    try:
-        if async:
-            manager = multiprocessing.Manager()
-            info = manager.list()
-            proxy = ee.serializer.encode(eeobject)
-            process = multiprocessing.Process(target=get_async2, args=(eeobject, info))
-            process.start()
-            # process.join()
+    for i, eeobject in enumerate(args):
+        # DO THE SAME FOR EVERY OBJECT
+        if do_async:
+            thread = threading.Thread(target=get_info,
+                                      args=(eeobject, i))
+            thread.start()
         else:
+            get_info(eeobject, i)
+
+    for result in info_return:
+        pp.pprint(result)
+
+
+def getInfo(eeobject):
+    """ Get eeobject information (getInfo) asynchronously. For not async just
+    use `ee.data.getInfo` """
+
+    class newDict(dict):
+        def get(self):
+            return self['info']
+        def __call__(self):
+            return self.get()
+
+    result = newDict({'info':None})
+
+    def get_info(eeobject, from_ee):
+        if from_ee:
             info = eeobject.getInfo()
-
-    except Exception as e:
-        print(str(e))
-        info = eeobject
-
-    if not notebook:
-        if async:
-            def finalwait():
-                isinfo = len(info) > 0
-                while not isinfo:
-                    isinfo = len(info) > 0
-                pp.pprint(info[0])
-            p = multiprocessing.Process(target=finalwait, args=())
-            p.start()
         else:
-            pp.pprint(info)
+            info = eeobject
+
+        result['info'] = info
+
+    module = getattr(eeobject, '__module__', None)
+    parent = module.split('.')[0] if module else None
+    if parent == ee.__name__:
+        thread = threading.Thread(target=get_info, args=(eeobject, True))
+        thread.start()
     else:
-        from geetools.ui.ipytools import create_accordion
-        from IPython.display import display
-        output = create_accordion(info)
-        display(output)
+        get_info(eeobject, False)
+
+    return result

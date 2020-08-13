@@ -6,8 +6,6 @@ import ee.data
 import os
 import json
 
-if not ee.data._initialized:
-    ee.Initialize()
 
 def esave(eeobject, filename, path=None):
     """ Saves any EE object to a file with extension .gee
@@ -20,6 +18,7 @@ def esave(eeobject, filename, path=None):
 
     with open(os.path.join(path, filename+'.gee'), 'w') as js:
         json.dump(obj, js)
+
 
 def eopen(file, path=None):
     """ Opens a files saved with `esave` method

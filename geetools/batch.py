@@ -1,41 +1,49 @@
 # coding=utf-8
 """ Module holding batch processing for Earth Engine """
 import ee
-import ee.data
 from . import tools
 import os
 import functools
 import traceback
 import time
-
-if not ee.data._initialized:
-    ee.Initialize()
+from .utils import *
 
 
-def recrusive_delete_asset(assetId):
-    try:
-        content = ee.data.getList({'id':assetId})
-    except Exception as e:
-        print(str(e))
-        return
+def recrusiveDeleteAsset(assetId):
+    info = ee.data.getInfo(assetId)
+    if info:
+        ty = info['type']
+        if ty in ['Image', 'FeatureCollection']:
+            # setting content to 0 will delete the assetId
+            content = 0
+        elif ty in ['Folder', 'ImageCollection']:
+            try:
+                content = ee.data.getList({'id':assetId})
+            except Exception as e:
+                print(str(e))
+                return
+        else:
+            print("Can't handle {} type yet".format(ty))
 
-    if content == 0:
-        # delete empty colletion and/or folder
-        ee.data.deleteAsset(assetId)
+        if content == 0:
+            # delete empty colletion and/or folder
+            ee.data.deleteAsset(assetId)
+        else:
+            for asset in content:
+                path = asset['id']
+                ty = asset['type']
+                if ty == 'Image':
+                    # print('deleting {}'.format(path))
+                    ee.data.deleteAsset(path)
+                else:
+                    recrusiveDeleteAsset(path)
+            # delete empty collection and/or folder
+            ee.data.deleteAsset(assetId)
     else:
-        for asset in content:
-            path = asset['id']
-            ty = asset['type']
-            if ty == 'Image':
-                # print('deleting {}'.format(path))
-                ee.data.deleteAsset(path)
-            else:
-                recrusive_delete_asset(path)
-        # delete empty collection and/or folder
-        ee.data.deleteAsset(assetId)
+        print('{} does not exists or there is another problem'.format(assetId))
 
 
-def convert_data_type(newtype):
+def convertDataType(newtype):
     """ Convert an image to the specified data type
 
     :param newtype: the data type. One of 'float', 'int', 'byte', 'double',
@@ -59,7 +67,7 @@ def convert_data_type(newtype):
     return wrap
 
 
-def create_assets(asset_ids, asset_type, mk_parents):
+def createAssets(asset_ids, asset_type, mk_parents):
     """Creates the specified assets if they do not exist.
     This is a fork of the original function in 'ee.data' module with the
     difference that
@@ -140,15 +148,15 @@ class Image(object):
 
         :param image: the image to download
         :type image: ee.Image
-        :param path: the path to download the image. If None, it will be downloaded
-            to the same folder as the script is
+        :param path: the path to download the image. If None, it will be
+            downloaded to the same folder as the script is
         :type path: str
         :param name: name of the file
         :type name: str
         :param scale: scale of the image to download. If None, tries to get it.
         :type scale: int
-        :param region: region to from where to download the image. If None, will be
-            the image region
+        :param region: region to from where to download the image. If None,
+            will be the image region
         :type region: ee.Geometry
         :param
         """
@@ -160,15 +168,8 @@ class Image(object):
             import zipfile
         except:
             raise ValueError(
-                'zipfile module not found, install it using `pip install zipfile`')
-
-        try:
-            from osgeo import gdal
-        except ImportError:
-            try:
-                import gdal
-            except:
-                raise
+                'zipfile module not found, install it using '
+                '`pip install zipfile`')
 
         # Reproject image
         # image = image.reproject(ee.Projection('EPSG:4326'))
@@ -185,7 +186,8 @@ class Image(object):
         params = {'region': region,
                   'scale': scale}
 
-        params = params.update({'dimensions': dimensions}) if dimensions else params
+        if dimensions:
+            params = params.update({'dimensions': dimensions})
 
         url = image.getDownloadURL(params)
 
@@ -217,43 +219,41 @@ class Image(object):
         except:
             raise
 
-        # Merge TIFF
-        # alltif = glob.glob(os.path.join(finalpath, '.tif'))
-        # outvrt = '/vsimem/stacked.vrt' #/vsimem is special in-memory virtual "directory"
-        # outtif = os.path.join(finalpath, name+'.tif')
-        #
-        # outds = gdal.BuildVRT(outvrt, alltif, separate=True)
-        # gdal.Translate(outtif, outds)
-
     @staticmethod
     def toAsset(image, assetPath, name=None, to='Folder', scale=None,
-                    region=None, create=True, dataType='float', **kwargs):
+                region=None, create=True, dataType='float',
+                notebook=False, **kwargs):
         """ This function can create folders and ImageCollections on the fly.
         The rest is the same to Export.image.toAsset. You can pass the same
         params as the original function
 
         :param image: the image to upload
         :type image: ee.Image
-        :param assetPath: path to upload the image (only PATH, without filename)
+        :param assetPath: path to upload the image (only PATH, without
+            filename)
         :type assetPath: str
         :param name: filename for the image (AssetID will be assetPath + name)
         :type name: str
-        :param to: where to save the image. Options: 'Folder' or 'ImageCollection'
+        :param to: where to save the image. Options: 'Folder' or
+            'ImageCollection'
         :param region: area to upload. Defualt to the footprint of the first
             image in the collection
         :type region: ee.Geometry.Rectangle or ee.Feature
         :param scale: scale of the image (side of one pixel)
             (Landsat resolution)
         :type scale: int
-        :param dataType: as downloaded images **must** have the same data type in all
-            bands, you have to set it here. Can be one of: "float", "double", "int",
-            "Uint8", "Int8" or a casting function like *ee.Image.toFloat*
+        :param dataType: as downloaded images **must** have the same data type
+            in all bands, you have to set it here. Can be one of: "float",
+            "double", "int", "Uint8", "Int8" or a casting function like
+            *ee.Image.toFloat*
         :type dataType: str
+        :param notebook: display a jupyter notebook widget to monitor the task
+        :type notebook: bool
         :return: the tasks
         :rtype: ee.batch.Task
         """
         # Convert data type
-        image = convert_data_type(dataType)(image)
+        image = convertDataType(dataType)(image)
 
         # Check if the user is specified in the asset path
         is_user = (assetPath.split('/')[0] == 'users')
@@ -268,7 +268,7 @@ class Image(object):
         if create:
             # Recrusive create path
             path2create = assetPath #  '/'.join(assetPath.split('/')[:-1])
-            create_assets([path2create], to, True)
+            createAssets([path2create], to, True)
 
         # Region
         region = tools.geometry.getRegion(region)
@@ -276,12 +276,18 @@ class Image(object):
         name = name if name else image.id().getInfo()
         # Asset ID (Path + name)
         assetId = '/'.join([assetPath, name])
+        # Description
+        description = name.replace('/','_')
         # Init task
         task = ee.batch.Export.image.toAsset(image, assetId=assetId,
                                              region=region, scale=scale,
-                                             description=name,
+                                             description=description,
                                              **kwargs)
         task.start()
+
+        if notebook:
+            pass
+
         return task
 
     @staticmethod
@@ -323,7 +329,7 @@ class Image(object):
                 name = 'unknown_image'
 
         # convert data type
-        convert_data_type(dataType)
+        image = convertDataType(dataType)(image)
 
         def unpack(thelist):
             unpacked = []
@@ -371,13 +377,18 @@ class Image(object):
 class ImageCollection(object):
 
     @staticmethod
-    def toDrive(col, folder, scale=30, dataType="float", region=None,
-                **kwargs):
-        """ Upload all images from one collection to Google Drive. You can use the
-        same arguments as the original function ee.batch.export.image.toDrive
+    def toDrive(collection, folder, namePattern='{id}', scale=30,
+                dataType="float", region=None, datePattern=None, **kwargs):
+        """ Upload all images from one collection to Google Drive. You can use
+        the same arguments as the original function
+        ee.batch.export.image.toDrive
 
-        :param col: Collection to upload
-        :type col: ee.ImageCollection
+        :param collection: Collection to upload
+        :type collection: ee.ImageCollection
+        :param folder: Google Drive folder to export the images to
+        :type folder: str
+        :param namePattern: pattern for the name. See make_name function
+        :type namePattern: str
         :param region: area to upload. Defualt to the footprint of the first
             image in the collection
         :type region: ee.Geometry.Rectangle or ee.Feature
@@ -386,45 +397,56 @@ class ImageCollection(object):
         :type scale: int
         :param maxImgs: maximum number of images inside the collection
         :type maxImgs: int
-        :param dataType: as downloaded images **must** have the same data type in all
-            bands, you have to set it here. Can be one of: "float", "double", "int",
-            "Uint8", "Int8" or a casting function like *ee.Image.toFloat*
+        :param dataType: as downloaded images **must** have the same data type
+            in all bands, you have to set it here. Can be one of: "float",
+            "double", "int", "Uint8", "Int8" or a casting function like
+            *ee.Image.toFloat*
         :type dataType: str
+        :param datePattern: pattern for date if specified in namePattern.
+            Defaults to 'yyyyMMdd'
+        :type datePattern: str
         :return: list of tasks
         :rtype: list
         """
-        size = col.size().getInfo()
-        alist = col.toList(size)
+        # empty tasks list
         tasklist = []
+        # get region
+        region = tools.geometry.getRegion(region)
+        # Make a list of images
+        img_list = collection.toList(collection.size())
 
-        if region is None:
-            region = ee.Image(alist.get(0)).geometry().getInfo()["coordinates"]
-        else:
-            region = tools.geometry.getRegion(region)
+        n = 0
+        while True:
+            try:
+                img = ee.Image(img_list.get(n))
 
-        for idx in range(0, size):
-            img = alist.get(idx)
-            img = ee.Image(img)
-            name = img.id().getInfo().split("/")[-1]
+                name = makeName(img, namePattern, datePattern)
 
-            # convert data type
-            convert_data_type(dataType)
+                # convert data type
+                img = convertDataType(dataType)(img)
 
-            task = ee.batch.Export.image.toDrive(image=img,
-                                                 description=name,
-                                                 folder=folder,
-                                                 fileNamePrefix=name,
-                                                 region=region,
-                                                 scale=scale, **kwargs)
-            task.start()
-            tasklist.append(task)
-
-        return tasklist
+                task = ee.batch.Export.image.toDrive(image=img,
+                                                     description=name,
+                                                     folder=folder,
+                                                     fileNamePrefix=name,
+                                                     region=region,
+                                                     scale=scale, **kwargs)
+                task.start()
+                tasklist.append(task)
+                n += 1
+            except Exception as e:
+                error = str(e).split(':')
+                if error[0] == 'List.get':
+                    break
+                else:
+                    raise e
 
     @staticmethod
-    def toAsset(col, assetPath, scale=30, region=None, create=True, **kwargs):
-        """ Upload all images from one collection to a Earth Engine Asset. You can
-        use the same arguments as the original function ee.batch.export.image.toDrive
+    def toAsset(col, assetPath, scale=30, region=None, create=True,
+                verbose=False, **kwargs):
+        """ Upload all images from one collection to a Earth Engine Asset.
+        You can use the same arguments as the original function
+        ee.batch.export.image.toDrive
 
         :param col: Collection to upload
         :type col: ee.ImageCollection
@@ -438,9 +460,10 @@ class ImageCollection(object):
         :type scale: int
         :param maxImgs: maximum number of images inside the collection
         :type maxImgs: int
-        :param dataType: as downloaded images **must** have the same data type in all
-            bands, you have to set it here. Can be one of: "float", "double", "int",
-            "Uint8", "Int8" or a casting function like *ee.Image.toFloat*
+        :param dataType: as downloaded images **must** have the same data type
+            in all bands, you have to set it here. Can be one of: "float",
+            "double", "int", "Uint8", "Int8" or a casting function like
+            *ee.Image.toFloat*
         :type dataType: str
         :return: list of tasks
         :rtype: list
@@ -450,7 +473,7 @@ class ImageCollection(object):
         tasklist = []
 
         if create:
-            create_assets([assetPath], 'ImageCollection', True)
+            createAssets([assetPath], 'ImageCollection', True)
 
         if region is None:
             first_img = ee.Image(alist.get(0))
@@ -473,9 +496,139 @@ class ImageCollection(object):
                                                  region=region,
                                                  scale=scale, **kwargs)
             task.start()
+
+            if verbose:
+                print('Exporting {} to {}'.format(name, assetId))
+
             tasklist.append(task)
 
         return tasklist
+
+
+class FeatureCollection(object):
+    @staticmethod
+    def toDict(collection, split_at=4000):
+        """ Get the FeatureCollection as a dict object """
+        size = collection.size()
+        condition = size.gte(4999)
+
+        def greater():
+            size = collection.size()
+            seq = tools.ee_list.sequence(0, size, split_at)
+            limits = ee.List.zip(seq.slice(1), seq)
+
+            def over_limits(n):
+                n = ee.List(n)
+                ini = ee.Number(n.get(0))
+                end = ee.Number(n.get(1))
+                return ee.FeatureCollection(collection.toList(ini, end))
+
+            return limits.map(over_limits)
+
+        collections = ee.List(
+            ee.Algorithms.If(condition,
+                             greater(),
+                             ee.List([collection])))
+
+        collections_size = collections.size().getInfo()
+
+        col = ee.FeatureCollection(collections.get(0))
+        content = col.getInfo()
+        feats = content['features']
+
+        for i in range(0, collections_size):
+            c = ee.FeatureCollection(collections.get(i))
+            content_c = c.getInfo()
+            feats_c = content_c['features']
+            feats = feats + feats_c
+
+        content['features'] = feats
+
+        return content
+
+    @staticmethod
+    def toGeoJSON(collection, name, path=None, split_at=4000):
+        """ Export a FeatureCollection to a GeoJSON file
+
+        :param collection: The collection to export
+        :type collection: ee.FeatureCollection
+        :param name: name of the resulting file
+        :type name: str
+        :param path: The path where to save the file. If None, will be saved
+            in the current folder
+        :type path: str
+        :param split_at: limit to avoid an EE Exception
+        :type split_at: int
+        :return: A GeoJSON (.geojson) file.
+        :rtype: file
+        """
+        import json
+        import os
+
+        if not path:
+            path = os.getcwd()
+
+        # name
+        if name[-8:-1] != '.geojson':
+            fname = name+'.geojson'
+
+        content = FeatureCollection.toDict(collection, split_at)
+
+        with open(os.path.join(path, fname), 'w') as thefile:
+            thefile.write(json.dumps(content))
+
+        return thefile
+
+    @staticmethod
+    def toCSV(collection, filename, split_at=4000):
+        """ Alternative to download a FeatureCollection as a CSV """
+        import csv
+        dict = FeatureCollection.toDict(collection, split_at)
+
+        fields = list(dict['columns'].keys())
+        fields.append('geometry')
+
+        features = dict['features']
+
+        ext = filename[-4:]
+        if ext != '.csv':
+            filename += '.csv'
+
+        with open(filename, 'w') as thecsv:
+            writer = csv.DictWriter(thecsv, fields)
+
+            writer.writeheader()
+            # write rows
+            for feature in features:
+                properties = feature['properties']
+                fid = feature['id']
+                geom = feature['geometry']['type']
+
+                # match fields
+                properties['system:index'] = fid
+                properties['geometry'] = geom
+
+                # write row
+                writer.writerow(properties)
+
+            return thecsv
+
+    @staticmethod
+    def toLocal(collection, filename, filetype=None, selectors=None):
+        """ Download a FeatureCollection to a local file
+
+        :param filetype: The filetype of download, either CSV or JSON.
+            Defaults to CSV.
+        :param selectors: The selectors that should be used to determine which
+            attributes will be downloaded.
+        :param filename: The name of the file to be downloaded
+        """
+        if not filetype:
+            filetype = 'CSV'
+
+        url = collection.getDownloadURL(filetype, selectors, filename)
+        thefile = downloadFile(url, filename, filetype)
+        return thefile
 
 
 class Execli(object):
@@ -488,8 +641,8 @@ class Execli(object):
 
     def execli(self, function):
         """ This function tries to excecute a client side Earth Engine function
-            and retry as many times as needed. It is meant to use in cases when you
-            cannot access to the original function. See example.
+            and retry as many times as needed. It is meant to use in cases when
+            you cannot access to the original function. See example.
 
         :param function: the function to call TIMES
         :return: the return of function
@@ -527,8 +680,8 @@ class Execli(object):
 
     @staticmethod
     def execli_deco():
-        """ This is a decorating function to excecute a client side Earth Engine
-        function and retry as many times as needed.
+        """ This is a decorating function to excecute a client side Earth
+        Engine function and retry as many times as needed.
         Parameters can be set by modifing module's variables `_execli_trace`,
         `_execli_times` and `_execli_wait`
 

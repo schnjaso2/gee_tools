@@ -5,10 +5,58 @@ Tools for ee.Image
 from __future__ import absolute_import
 import ee
 import ee.data
-from . import ee_list
+import math
+from . import ee_list, date
+from ..utils import castImage
 
-if not ee.data._initialized:
-    ee.Initialize()
+
+def _add_suffix_prefix(image, value, option, bands=None):
+    """ Internal function to handle addPrefix and addSuffix """
+    if bands:
+        bands = ee.List(bands)
+
+    addon = ee.String(value)
+
+    allbands = image.bandNames()
+    bands_ = ee.List(ee.Algorithms.If(bands, bands, allbands))
+
+    def over_bands(band, first):
+        all = ee.List(first)
+        options = ee.Dictionary({
+            'suffix': ee.String(band).cat(addon),
+            'prefix': addon.cat(ee.String(band))
+        })
+        return all.replace(band, ee.String(options.get(option)))
+
+    newbands = bands_.iterate(over_bands, allbands)
+    newbands = ee.List(newbands)
+    return image.select(allbands, newbands)
+
+
+def addSuffix(image, suffix, bands=None):
+    """ Add a suffix to the specified bands
+
+    :param suffix: the value to add as a suffix
+    :type suffix: str
+    :param bands: the bands to apply the suffix. If None, suffix will fill
+        all bands
+    :type bands: list
+    :rtype: ee.Image
+    """
+    return _add_suffix_prefix(image, suffix, 'suffix', bands)
+
+
+def addPrefix(image, prefix, bands=None):
+    """ Add a prefix to the specified bands
+
+    :param prefix: the value to add as a prefix
+    :type prefix: str
+    :param bands: the bands to apply the prefix. If None, prefix will fill
+        all bands
+    :type bands: list
+    :rtype: ee.Image
+    """
+    return _add_suffix_prefix(image, prefix, 'prefix', bands)
 
 
 def empty(value=0, names=None, from_dict=None):
@@ -46,7 +94,16 @@ def empty(value=0, names=None, from_dict=None):
     return image
 
 
-def get_value(image, point, scale=None, side="server"):
+def emptyBackground(image, value=0):
+    """ Make all background pixels (not only masked, but all over the world)
+    take the parsed value """
+    bnames = image.bandNames()
+    emp = empty(value, bnames)
+    return ee.Image(emp.where(image, image).copyProperties(
+        source=image, properties=image.propertyNames()))
+
+
+def getValue(image, point, scale=None, side="server"):
     """ Return the value of all bands of the image in the specified point
 
     :param img: Image to get the info from
@@ -80,7 +137,7 @@ def get_value(image, point, scale=None, side="server"):
         raise ValueError("side parameter must be 'server' or 'client'")
 
 
-def addMultiBands(img, *imgs):
+def _addMultiBands(img, *imgs):
     """ Image.addBands for many images. All bands from all images will be
     put together, so if there is one band with the same name in different
     images, the first occurrence will keep the name and the rest will have a
@@ -93,6 +150,25 @@ def addMultiBands(img, *imgs):
     for i in imgs:
         img = img.addBands(i)
     return img
+
+
+def addMultiBands(image, imageList):
+    """ Image.addBands for many images. All bands from all images will be
+    put together, so if there is one band with the same name in different
+    images, the first occurrence will keep the name and the rest will have a
+    number suffix ({band}_1, {band}_2, etc)
+
+    :param image: images to add bands
+    :param imageList: a list of images
+    :type imageList: list or ee.List
+    :rtype: ee.Image
+    """
+    def iteration(img, ini):
+        ini = ee.Image(ini)
+        img = ee.Image(img)
+        return ini.addBands(img)
+
+    return ee.List(imageList).iterate(iteration, image)
 
 
 def renameDict(image, names):
@@ -119,24 +195,34 @@ def renameDict(image, names):
     >> {u'BLUE': 0.10094200074672699, u'GREEN': 0.07873955368995667, u'B3': 0.057160500437021255}
     """
     bandnames = image.bandNames()
-    newnames = ee_list.replace_many(bandnames, names)
+    newnames = ee_list.replaceDict(bandnames, names)
     return image.select(bandnames, newnames)
 
 
-def parametrize(image, range_from, range_to, bands=None):
-    """ Parametrize from a original known range to a fixed new range
+def removeBands(image, bands):
+    """ Remove the specified bands from an image """
+    bnames = image.bandNames()
+    bands = ee.List(bands)
+    inter = ee_list.intersection(bnames, bands)
+    diff = bnames.removeAll(inter)
+    return image.select(diff)
 
-    :Parameters:
+
+def parametrize(image, range_from, range_to, bands=None, drop=False):
+    """ Parametrize from a original **known** range to a fixed new range
+
     :param range_from: Original range. example: (0, 5000)
     :type range_from: tuple
     :param range_to: Fixed new range. example: (500, 1000)
     :type range_to: tuple
     :param bands: bands to parametrize. If *None* all bands will be
-    parametrized.
+        parametrized.
     :type bands: list
+    :param drop: drop the bands that will not be parametrized
+    :type drop: bool
 
-    :return: Function to use in map() or alone
-    :rtype: function
+    :return: the parsed image with the parsed bands parametrized
+    :rtype: ee.Image
     """
     original_range = range_from if isinstance(range_from, ee.List) \
         else ee.List(range_from)
@@ -159,16 +245,16 @@ def parametrize(image, range_from, range_to, bands=None):
     rango1 = max1.subtract(min1)
 
     # all bands
-    todas = image.bandNames()
+    all = image.bandNames()
 
     # bands to parametrize
     if bands:
-        bandasEE = ee.List(bands)
+        bands_ee = ee.List(bands)
     else:
-        bandasEE = image.bandNames()
+        bands_ee = image.bandNames()
 
-    inter = ee_list.intersection(bandasEE, todas)
-    diff = ee_list.difference(todas, inter)
+    inter = ee_list.intersection(bands_ee, all)
+    diff = ee_list.difference(all, inter)
     image_ = image.select(inter)
 
     # Percentage corresponding to the actual value
@@ -180,10 +266,12 @@ def parametrize(image, range_from, range_to, bands=None):
 
     final = percent.multiply(rango1).add(min1)
 
-    # Add the rest of the bands (no parametrized)
-    final = image.select(diff).addBands(final)
+    if not drop:
+        # Add the rest of the bands (no parametrized)
+        final = image.select(diff).addBands(final)
 
-    return passProperty(image, final, 'system:time_start')
+    # return passProperty(image, final, 'system:time_start')
+    return ee.Image(final.copyProperties(source=image))
 
 
 def sumBands(image, name="sum", bands=None):
@@ -201,6 +289,7 @@ def sumBands(image, name="sum", bands=None):
     :param bands: names of the bands to be added. If None (default) it sums
         all bands
     :type bands: tuple
+    :return: the parsed image with one additional band with the sum of `bands`
     :rtype: ee.Image
     """
     band_names = image.bandNames()
@@ -235,6 +324,7 @@ def replace(image, to_replace, to_add):
     :return: Same Image provided with the band replaced
     :rtype: ee.Image
     """
+    # TODO: see Image.addBands({overwrite:True})
     band = to_add.select([0])
     bands = image.bandNames()
     resto = bands.remove(to_replace)
@@ -331,7 +421,7 @@ def minscale(image):
     return ee.Number(bands.slice(1).iterate(wrap, ini))
 
 
-def compute_bits(image, start, end, newName):
+def computeBits(image, start, end, newName):
     """ Compute the bits of an image
 
     :param start: start bit
@@ -383,7 +473,7 @@ def passProperty(image, to, properties):
     return to
 
 
-def good_pix(image, retain=None, drop=None, name='good_pix'):
+def goodPix(image, retain=None, drop=None, name='good_pix'):
     """ Get a 'good pixels' bands from the image's bands that retain the good
     pixels and drop the bad pixels. It will first retain the retainable bands
     and then drop the droppable ones
@@ -419,102 +509,379 @@ def good_pix(image, retain=None, drop=None, name='good_pix'):
     return final.select([0], [name])
 
 
-class Mapping(object):
-    """ Mapping functions to map over ImageCollections """
+def toGrid(image, size=1, band=None, geometry=None):
+    """ Create a grid from pixels in an image. Results may depend on the image
+    projection. Work fine in Landsat imagery.
 
-    # TODO: should be possible to make a general method to map any function
-    # that starts with an image
+    IMPORTANT: This grid is not perfect, it can be misplaced and have some
+    holes due to projection.
 
+    :param image: the image
+    :type image: ee.Image
+    :param size: the size of each cell, according to:
+        - 1: 1 pixel
+        - 2: 9 pixels (3x3)
+        - 3: 25 pixels (5x5)
+        - and so on..
+    :type size: int
+    :param band: the band to get the projection (and so, the scale) from. If
+        None, the first one will be used
+    :type band: str
+    :param geometry: the geometry where the grid will be computed. If the image
+        is unbounded this parameter must be set in order to work. If None,
+        the image geometry will be used if not unbounded.
+    :type geometry: ee.Geometry or ee.Feature
+    """
+    band = band if band else 0
+    iband = image.select(band)
+
+    if geometry:
+        if isinstance(geometry, ee.Feature):
+            geometry = geometry.geometry()
+    else:
+        geometry = image.geometry()
+
+    projection = iband.projection()
+    scale = projection.nominalScale()
+    scale = scale.multiply((int(size)*2)-1)
+    buffer = scale.divide(2)
+
+    # get coordinates image
+    latlon = ee.Image.pixelLonLat().reproject(projection)
+
+    # put each lon lat in a list
+    coords = latlon.select(['longitude', 'latitude'])
+
+    coords = coords.reduceRegion(
+        reducer= ee.Reducer.toList(),
+        geometry= geometry.buffer(scale),
+        scale= scale)
+
+    # get lat & lon
+    lat = ee.List(coords.get('latitude'))
+    lon = ee.List(coords.get('longitude'))
+
+    # zip them. Example: zip([1, 3],[2, 4]) --> [[1, 2], [3,4]]
+    point_list = lon.zip(lat)
+
+    def over_list(p):
+        p = ee.List(p)
+        point = ee.Geometry.Point(p).buffer(buffer).bounds()
+        return ee.Feature(point)
+
+    # make grid
+    fc = ee.FeatureCollection(point_list.map(over_list))
+
+    return fc
+
+
+def renamePattern(image, pattern, bands=None):
+    """ Rename the bands of the parsed image with the given pattern
+
+    :param image:
+    :param pattern: the special keyword `{band}` will be replaced with the
+        actual band name. Spaces will be replaced with underscore. It also will
+        be trimmed
+    :param bands: the bands to rename. If None it'll rename all the bands
+    :return:
+    """
+    allbands = image.bandNames()
+
+    pattern = ee.String(pattern)
+    selected = image.select(bands) if bands else image
+
+    pattern = pattern.trim().split(' ').join('_')
+
+    bands_to_replace = selected.bandNames()
+
+    def wrap(name):
+        condition = pattern.index('{band}').gt(0)
+
+        return ee.String(ee.Algorithms.If(
+            condition,
+            pattern.replace('{band}', ee.String(name)),
+            ee.String(name)))
+
+    newbands = bands_to_replace.map(wrap)
+
+    new_allbands = ee_list.replaceDict(
+        allbands, ee.Dictionary.fromLists(bands_to_replace, newbands))
+
+    return image.select(allbands, new_allbands)
+
+
+def gaussFunction(image, band, range_min=None, range_max=None, mean=0,
+                  std=None, output_min=None, output_max=1, stretch=1,
+                  region=None, scale=None, name='gauss', **kwargs):
+    """ Apply the Guassian function to an Image.
+    https://en.wikipedia.org/wiki/Gaussian_function
+
+    :param band: the name of the band to use
+    :type band: str
+    :param range_min: the minimum pixel value in the parsed band. If None, it
+        will be computed
+    :param range_max: the maximum pixel value in the parsed band. If None, it
+        will be computed
+    :param mean: the position of the center of the peak. Defaults to 0
+    :type mean: int or float
+    :param std: the standard deviation value. Defaults to range/4
+    :type std: int or float
+    :param output_max: height of the curve's peak
+    :type output_max: int or float
+    :param output_min: the desired minimum of the curve
+    :type output_min: int or float
+    :param stretch: a stretching value. As bigger as stretch
+    :type stretch: int or float
+    :param name: name of the resulting band
+    :type name: strmax
+    """
+    image = image.select(band)
+
+    if not region:
+        region = image.geometry()
+
+    if not scale:
+        scale = image.projection().nominalScale()
+
+    if range_min is None and range_max is None:
+        minmax = image.reduceRegion(reducer=ee.Reducer.minMax(),
+                                    geometry=region, scale=scale, **kwargs)
+        minname = '{}_min'.format(band)
+        maxname = '{}_max'.format(band)
+
+        range_min = ee.Image.constant(minmax.get(minname))
+        range_max = ee.Image.constant(minmax.get(maxname))
+
+    elif range_min is None:
+        minmax = image.reduceRegion(reducer=ee.Reducer.min(),
+                                    geometry=region, scale=scale, **kwargs)
+        range_min = ee.Image.constant(minmax.get(band))
+        range_max = castImage(range_max)
+
+    elif range_max is None:
+        minmax = image.reduceRegion(reducer=ee.Reducer.max(),
+                                    geometry=region, scale=scale, **kwargs)
+        range_max = ee.Image.constant(minmax.get(band))
+        range_min = castImage(range_min)
+    else:
+        range_max = castImage(range_max)
+        range_min = castImage(range_min)
+
+    mean = castImage(mean)
+
+    if std is None:
+        std = range_max.subtract(range_min).divide(4)
+    else:
+        std = castImage(std)
+
+    output_min = castImage(output_min)
+    output_max = castImage(output_max)
+    stretch = castImage(stretch)
+
+    def compute_gauss(img):
+        result = ee.Image().expression(
+            'exp(((val-mean)**2)/(-2*(std**2))*(abs(stretch)))*max',
+            {'val': img,
+             'mean': mean,
+             'std': std,
+             'max': output_max,
+             'stretch': stretch
+             })
+        return result
+
+    no_parametrized = compute_gauss(image)
+
+    if output_min is None:
+        return no_parametrized.rename(name)
+    else:
+        min_result = compute_gauss(range_min)
+        max_result = compute_gauss(range_max)
+        min_result_final = min_result.min(max_result)
+
+        parametrized = ee.Image().expression(
+            '(value-min_result)/(max-min_result)*(max-min)+min',
+            {'value': no_parametrized,
+             'min_result': min_result_final,
+             'max': output_max,
+             'min': output_min
+             })
+        return parametrized.rename(name)
+
+
+def normalDistribution(image, band, mean=None, std=None, region=None,
+                       scale=None, name='normal_distribution', **kwargs):
+    """ Compute a Normal Distribution using the Gaussian Function """
+    pi = ee.Number(math.pi)
+
+    image = image.select(band)
+
+    if mean is None:
+        mean = image.reduceRegion(reducer=ee.Reducer.mean(),
+                                  geometry=region, scale=scale, **kwargs)
+        mean = ee.Image.constant(mean.get(band))
+    else:
+        mean = castImage(mean)
+
+    if std is None:
+        std = image.reduceRegion(reducer=ee.Reducer.stdDev(),
+                                 geometry=region, scale=scale, **kwargs)
+        std = ee.Image.constant(std.get(band))
+    else:
+        std = castImage(std)
+
+    output_max = ee.Image(1)\
+                   .divide(std.multiply(ee.Image(2).multiply(pi).sqrt()))
+
+    return gaussFunction(image, band, mean=mean, std=std,
+                         output_max=output_max, name=name, **kwargs)
+
+
+def linearFunction(image, band, range_min=None, range_max=None, mean=None,
+                   output_min=None, output_max=None, name='linear_function',
+                   region=None, scale=None, **kwargs):
+    """ Apply a linear function over one image band using the following
+    formula:
+
+    - a = abs(val-mean)
+    - b = output_max-output_min
+    - c = abs(range_max-mean)
+    - d = abs(range_min-mean)
+    - e = max(c, d)
+
+    f(x) = a*(-1)*(b/e)+output_max
+
+    :param band: the band to process
+    :param range_min: the minimum pixel value in the parsed band. If None, it
+        will be computed over the parsed region (heavy process that can fail)
+    :param range_max: the maximum pixel value in the parsed band. If None, it
+        will be computed over the parsed region (heavy process that can fail)
+    :param output_min: the minimum value that will take the resulting band.
+    :param output_max: the minimum value that will take the resulting band.
+    :param mean: the value on the given range that will take the `output_max`
+        value
+    :param name: the name of the resulting band
+    :param region: the region to reduce over if no `range_min` and/or no
+        `range_max` has been parsed
+    :param scale: the scale that will be use for reduction if no `range_min`
+        and/or no `range_max` has been parsed
+    :param kwargs: extra arguments for the reduction: crs, crsTransform,
+        bestEffort, maxPixels, tileScale.
+    :return: a one band image that results of applying the linear function
+        over every pixel in the image
+    :rtype: ee.Image
+    """
+    image = image.select(band)
+
+    if not region:
+        region = image.geometry()
+
+    if not scale:
+        scale = image.projection().nominalScale()
+
+    if range_min is None and range_max is None:
+        minmax = image.reduceRegion(reducer=ee.Reducer.minMax(),
+                                    geometry=region, scale=scale, **kwargs)
+        minname = '{}_min'.format(band)
+        maxname = '{}_max'.format(band)
+
+        imin = ee.Image.constant(minmax.get(minname))
+        imax = ee.Image.constant(minmax.get(maxname))
+
+    elif range_min is None:
+        minmax = image.reduceRegion(reducer=ee.Reducer.min(),
+                                    geometry=region, scale=scale, **kwargs)
+        imin = ee.Image.constant(minmax.get(band))
+        imax = castImage(range_max)
+
+    elif range_max is None:
+        minmax = image.reduceRegion(reducer=ee.Reducer.max(),
+                                    geometry=region, scale=scale, **kwargs)
+        imax = ee.Image.constant(minmax.get(band))
+        imin = castImage(range_min)
+    else:
+        imax = castImage(range_max)
+        imin = castImage(range_min)
+
+    if mean is None:
+        imean = imax
+    else:
+        imean = castImage(mean)
+
+    if output_max is None:
+        output_max = imax
+
+    if output_min is None:
+        output_min = imin
+
+    a = imax.subtract(imean).abs()
+    b = imin.subtract(imean).abs()
+    t = a.max(b)
+
+    result = ee.Image().expression(
+        'abs(val-mean)*(-1)*((max-min)/t)+max',
+        {'val': image,
+         'mean': imean,
+         't': t,
+         'imin': imin,
+         'max': output_max,
+         'min': output_min
+         })
+
+    return result.rename(name)
+
+
+def doyToDate(image, dateFormat='yyyyMMdd', year=None):
+    """ Make a date band from a day of year band """
+    if not year:
+        year = image.date().get('year')
+
+    doyband = image.select([0])
+    leap = date.isLeap(year)
+    limit = ee.Number(ee.Algorithms.If(leap, 365, 364))
+    alldoys = ee.List.sequence(1, limit)
+
+    def wrap(doy, i):
+        i = ee.Image(i)
+        doy = ee.Number(doy)
+        d = date.fromDOY(doy, year)
+        date_band = ee.Image.constant(ee.Number.parse(d.format(dateFormat)))
+        condition = i.eq(doy)
+        return i.where(condition, date_band)
+
+    datei = ee.Image(alldoys.iterate(wrap, doyband))
+
+    return datei.rename('date')
+
+
+def maskInside(image, geometry):
+    """ This is the opposite to ee.Image.clip(geometry) """
+    mask = ee.Image.constant(1).clip(geometry).mask().Not()
+    return image.updateMask(mask)
+
+
+class Classification(object):
+    """ Class holding (static) methods for classified images. """
     @staticmethod
-    def parametrize(range_from, range_to, bands=None):
-        """ Parametrize from a original known range to a fixed new range
+    def vectorize(image, categories, label='label'):
+        """ Reduce to vectors the selected classes fro a classified image
 
-        :Parameters:
-        :param range_from: Original range. example: (0, 5000)
-        :type range_from: tuple
-        :param range_to: Fixed new range. example: (500, 1000)
-        :type range_to: tuple
-        :param bands: bands to parametrize. If *None* all bands will be
-        parametrized.
-        :type bands: list
+        :param categories: the categories to vectorize
+        :type categories: list
 
-        :return: Function to use in map() or alone
-        :rtype: function
         """
-        def wrap(img):
-            return parametrize(img, range_from, range_to, bands)
-        return wrap
+        def over_cat(cat, ini):
+            cat = ee.Number(cat)
+            ini = ee.Image(ini)
+            return ini.add(image.eq(cat).multiply(cat))
 
-    @staticmethod
-    def renameDict(names):
-        """ Renames bands of images using a dict. Can be used in one image or
-            in a collection
+        filtered = ee.Image(
+            ee.List(categories).iterate(over_cat,
+                                        empty(0, [label])))
 
-        :param names: matching names where key is original name and values the
-            new name
-        :type names: dict
-        :return: a function to rename images
-        :rtype: function
+        out = filtered.neq(0)
+        filtered = filtered.updateMask(out)
 
-        :EXAMPLE:
-
-        .. code:: python
-
-            p = ee.Geometry.Point(-71.72029495239258, -42.78997046797438)
-            collection = ee.ImageCollection("COPERNICUS/S2").filterBounds(p)
-            image = ee.Image(collection.first())
-
-            f = Image.Mapping.rename_bands({"B2":"BLUE", "B3":"GREEN"})
-            renamed = collection.map(f)
-            i = ee.Image(renamed.first())
-
-            print get_value(image, p)
-            print get_value(i, p)
-
-        >> {u'B1': 0.1009, u'B2': 0.078, u'B3': 0.057}
-        >> {u'BLUE': 0.1009, u'GREEN': 0.078, u'B3': 0.057}
-        """
-        def wrap(img):
-            return renameDict(img, names)
-        return wrap
-
-    @staticmethod
-    def sumBands(name="sum", bands=None):
-        """ Adds all *bands* values and puts the result on *name*.
-
-        .. code:: python
-
-            col = ee.ImageCollection("LANDSAT/LC8_L1T_TOA_FMASK")
-            fsum = Image.Mapping.sumBands("added_bands", ("B1", "B2", "B3"))
-            newcol = col.map(fsum)
-
-        :param name: name for the band that contains the added values of bands
-        :type name: str
-        :param bands: names of the bands to be added. If None (default) it sums
-            all bands
-        :type bands: tuple
-        :return: The function to use in ee.ImageCollection.map()
-        :rtype: function
-        """
-        def wrap(img):
-            return sumBands(img, name, bands)
-        return wrap
-
-    @staticmethod
-    def addConstantBands(value=None, *names, **pairs):
-        def apply(img):
-            return addConstantBands(img, value, *names, **pairs)
-        return apply
-
-    @staticmethod
-    def compute_bits(start, end, newName):
-        def wrap(img):
-            return img.compute_bits(img, start, end, newName)
-        return wrap
-
-    @staticmethod
-    def good_pix(retain=None, drop=None, name='good_pix'):
-        def wrap(img):
-            return good_pix(img, retain, drop, name)
-        return wrap
-
+        return filtered.reduceToVectors(**{
+            'scale': 30,
+            'maxPixels':1e13,
+            'labelProperty': label})
